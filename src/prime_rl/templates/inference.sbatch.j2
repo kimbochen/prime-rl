@@ -51,7 +51,7 @@ export VLLM_CACHE_ROOT=/tmp/.vllm_cache_$(whoami)
 
 # Setup environment
 cd $PROJECT_DIR
-[ -f .env ] && source .env
+[ -f .env ] && { set -a; source .env; set +a; }
 source .venv/bin/activate
 uv sync --all-extras
 
@@ -105,7 +105,7 @@ echo "INFER_URLS=${INFER_URLS}"
 # Run inference
 srun bash -c '
     cd $PROJECT_DIR
-    [ -f .env ] && source .env
+    [ -f .env ] && { set -a; source .env; set +a; }
     source .venv/bin/activate
 
     # Infiniband setup

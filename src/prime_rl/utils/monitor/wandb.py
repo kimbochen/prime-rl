@@ -191,7 +191,7 @@ class WandbMonitor(Monitor):
                 "env": env_name,
                 "task": rollout.get("task"),
                 "example_id": rollout["example_id"],
-                "completion": completion,
+                "completion": json.dumps(completion) if isinstance(completion, list) else str(completion),
                 "reward": rollout["reward"],
             }
             self.eval_samples_table.add_data(*sample.values())

@@ -529,6 +529,8 @@ class RLConfig(BaseConfig):
         """Auto-setup shared model config for trainer, orchestrator, and inference."""
         if self.model is not None:
             self.trainer.model.name = self.model.name
+            if "name" not in self.trainer.tokenizer.model_fields_set:
+                self.trainer.tokenizer.name = self.model.name
             if self.inference is not None:
                 inference_model_explicitly_set = "name" in self.inference.model.model_fields_set
                 if not inference_model_explicitly_set:

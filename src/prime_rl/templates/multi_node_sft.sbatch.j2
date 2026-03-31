@@ -46,7 +46,7 @@ echo "MASTER_ADDR=${MASTER_ADDR}"
 echo "MASTER_PORT=${MASTER_PORT}"
 
 # Install environment
-[ -f $PROJECT_DIR/.env ] && source $PROJECT_DIR/.env
+[ -f $PROJECT_DIR/.env ] && { set -a; source $PROJECT_DIR/.env; set +a; }
 source $PROJECT_DIR/.venv/bin/activate
 
 # Install environment as local package
@@ -61,7 +61,7 @@ cd $PROJECT_DIR && uv sync --all-extras
 # Run SFT
 srun bash -c '
     # Setup environment
-    [ -f $PROJECT_DIR/.env ] && source $PROJECT_DIR/.env
+    [ -f $PROJECT_DIR/.env ] && { set -a; source $PROJECT_DIR/.env; set +a; }
     source $PROJECT_DIR/.venv/bin/activate
 
     # Higher ulimit
