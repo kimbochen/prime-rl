@@ -6,16 +6,20 @@ level = "debug"
 [model]
 name = "Qwen/Qwen3-30B-A3B-Thinking-2507"
 
+[trainer.tokenizer]
+name = "Qwen/Qwen3-30B-A3B-Thinking-2507"
+
 [weight_broadcast]
 type = "nccl"
 
 [deployment]
 type = "multi_node"
-num_train_nodes = 2
-num_infer_nodes = 2
+num_train_nodes = 1
+num_infer_nodes = 1
 
 [slurm]
 job_name = "swe-qwen30b"
+partition = "main"
 
 [ckpt]
 interval = 100
@@ -25,9 +29,11 @@ project = "qwen30b-swe"
 
 [trainer.model]
 impl = "custom"
-attn = "flash_attention_3"
+attn = "flash_attention_2"
+fused_lm_head_token_chunk_size = 1024
 ep = 8
 cp = 2
+optim_cpu_offload = true
 
 [trainer.model.compile]
 
@@ -42,8 +48,8 @@ type = "adamw"
 lr = 1e-6
 
 [orchestrator]
-batch_size = 512
-oversampling_factor = 2
+batch_size = 128
+oversampling_factor = 1.5
 max_off_policy_steps = 16
 
 [[orchestrator.env]]
@@ -53,6 +59,7 @@ args = { max_turns = 200, cpu_cores = 2,  memory_gb = 4, disk_size_gb = 4, label
 
 [orchestrator.eval]
 interval = 25
+eval_base_model = false
 
 [[orchestrator.eval.env]]
 id = "mini-swe-agent-plus"
@@ -63,6 +70,12 @@ args = { dataset_name="PrimeIntellect/SWE-Bench-Verified-Quick", max_turns = 200
 easy_threshold = 1.0
 hard_threshold = 0.0
 seed = 42
+
+[inference]
+use_deep_gemm = false
+
+[inference.model]
+tool_call_parser = "auto"
 
 [inference.parallel]
 tp = 8
