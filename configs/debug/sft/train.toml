@@ -1,7 +1,14 @@
 max_steps = 5
 
 [model]
-name = "PrimeIntellect/Qwen3-0.6B" 
+name = "PrimeIntellect/Qwen3-0.6B"
+
+[deployment]
+gpus_per_node = 1
+num_gpus = 1
+
+[slurm]
+partition = "h200"
 
 [data]
 type = "fake"

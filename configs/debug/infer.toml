@@ -1,2 +1,8 @@
+[deployment]
+gpus_per_node = 1
+
+[slurm]
+partition = "h200"
+
 [model]
 enforce_eager = true
