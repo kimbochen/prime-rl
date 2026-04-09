@@ -863,21 +863,6 @@ requires-dist = [
 ]
 
 [[package]]
-name = "flash-attn-3"
-version = "3.0.0"
-source = { registry = "https://download.pytorch.org/whl/test/cu128" }
-dependencies = [
-    { name = "einops", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
-    { name = "ninja", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
-    { name = "packaging", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
-    { name = "torch", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
-]
-wheels = [
-    { url = "https://download.pytorch.org/whl/test/cu128/flash_attn_3-3.0.0-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:10a730d5e1a1c23afd930ce419ee425cd1925a16b7eac789dfe98c3ca39bc009" },
-    { url = "https://download.pytorch.org/whl/test/cu128/flash_attn_3-3.0.0-cp39-abi3-manylinux_2_34_aarch64.whl", hash = "sha256:bbb51d13d7aa1bfe04ef8875ed1bf630ebb116775084a5df612495e10609cd76" },
-]
-
-[[package]]
 name = "flash-attn-4"
 version = "4.0.0b6.dev7+gabd9943"
 source = { git = "https://github.com/Dao-AILab/flash-attention.git?subdirectory=flash_attn%2Fcute&rev=abd9943b#abd9943b66704f650ea1485a17126cd3817d1b1d" }
@@ -2693,9 +2678,6 @@ envs = [
 flash-attn = [
     { name = "flash-attn", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
-flash-attn-3 = [
-    { name = "flash-attn-3", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
-]
 flash-attn-cute = [
     { name = "flash-attn-4", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
 ]
@@ -2730,7 +2712,6 @@ requires-dist = [
     { name = "deepdive", marker = "extra == 'envs'", index = "https://hub.primeintellect.ai/primeintellect/simple/" },
     { name = "dion", git = "https://github.com/samsja/dion.git?rev=d891eeb" },
     { name = "flash-attn", marker = "platform_machine == 'x86_64' and extra == 'flash-attn'", url = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3+cu128torch2.10-cp312-cp312-linux_x86_64.whl" },
-    { name = "flash-attn-3", marker = "extra == 'flash-attn-3'", index = "https://download.pytorch.org/whl/test/cu128" },
     { name = "flash-attn-4", marker = "extra == 'flash-attn-cute'", git = "https://github.com/Dao-AILab/flash-attention.git?subdirectory=flash_attn%2Fcute&rev=abd9943b" },
     { name = "flash-linear-attention", git = "https://github.com/fla-org/flash-linear-attention" },
     { name = "jaxtyping", specifier = ">=0.3.2" },
@@ -2775,7 +2756,7 @@ requires-dist = [
     { name = "wandb", specifier = ">=0.24.2" },
     { name = "wiki-search", marker = "extra == 'envs'", index = "https://hub.primeintellect.ai/primeintellect/simple/" },
 ]
-provides-extras = ["flash-attn", "flash-attn-3", "flash-attn-cute", "envs", "disagg", "quack", "all"]
+provides-extras = ["flash-attn", "flash-attn-cute", "envs", "disagg", "quack", "all"]
 
 [package.metadata.requires-dev]
 dev = [

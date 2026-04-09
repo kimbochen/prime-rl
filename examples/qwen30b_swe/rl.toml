@@ -19,7 +19,7 @@ num_infer_nodes = 1
 
 [slurm]
 job_name = "swe-qwen30b"
-partition = "main"
+partition = "h200"
 
 [ckpt]
 interval = 100
@@ -29,7 +29,7 @@ project = "qwen30b-swe"
 
 [trainer.model]
 impl = "custom"
-attn = "flash_attention_2"
+attn = "flash_attention_3"
 fused_lm_head_token_chunk_size = 1024
 ep = 8
 cp = 2
