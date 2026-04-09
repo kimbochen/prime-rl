@@ -447,6 +447,7 @@ def write_slurm_script(config: RLConfig, config_dir: Path, script_path: Path) ->
             kv_offload_cpu_bytes=int(infer_deploy.kv_cache_offload.cpu_bytes) if infer_deploy.kv_cache_offload else 0,
             use_nccl_broadcast=config.weight_broadcast is not None and config.weight_broadcast.type == "nccl",
             wandb_shared=config.wandb is not None and config.wandb.shared,
+            wandb_project=config.wandb.project if config.wandb else None,
             ranks_filter=",".join(map(str, config.trainer.log.ranks_filter)),
         )
     else:
@@ -469,6 +470,7 @@ def write_slurm_script(config: RLConfig, config_dir: Path, script_path: Path) ->
             inference_data_parallel_rpc_port=config.inference.data_parallel_rpc_port if config.inference else 29600,
             use_nccl_broadcast=config.weight_broadcast is not None and config.weight_broadcast.type == "nccl",
             wandb_shared=config.wandb is not None and config.wandb.shared,
+            wandb_project=config.wandb.project if config.wandb else None,
             ranks_filter=",".join(map(str, config.trainer.log.ranks_filter)),
         )
 

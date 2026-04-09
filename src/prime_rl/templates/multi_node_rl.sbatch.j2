@@ -17,7 +17,6 @@
 {%- if exclude %}
 #SBATCH --exclude={{ exclude }}
 {%- endif %}
-#SBATCH --exclusive
 #SBATCH --output={{ output_dir }}/job_%j.log
 #SBATCH --error={{ output_dir }}/job_%j.log
 
@@ -70,6 +69,7 @@ export OMP_NUM_THREADS=1
 {% if wandb_shared -%}
 export WANDB_SHARED_MODE=1
 export WANDB_SHARED_RUN_ID=$(python3 -c "import uuid; print(uuid.uuid4().hex)")
+export WANDB_PROJECT={{ wandb_project }}
 {%- endif %}
 
 # Networking
@@ -181,6 +181,17 @@ if [ "$SLURM_PROCID" -lt "$NUM_INFER_NODES" ]; then
     echo "INFER_NODE_RANK=$INFER_NODE_RANK REPLICA=$REPLICA_IDX RANK_IN_REPLICA=$RANK_IN_REPLICA LOCAL_IP=$LOCAL_IP" \
         | tee $OUTPUT_DIR/logs/inference/node_${INFER_NODE_RANK}.log
 
+{% if wandb_shared -%}
+    start_vllm_metrics_logger() {
+        local port=$1
+        python -m prime_rl.utils.vllm_metrics_logger \
+            --metrics-url "http://localhost:${port}/metrics" \
+            --project "$WANDB_PROJECT" \
+            --node-rank "$INFER_NODE_RANK" \
+            >> $OUTPUT_DIR/logs/inference/metrics_${INFER_NODE_RANK}.log 2>&1 &
+    }
+{%- endif %}
+
 {% if is_disaggregated -%}
     # PD disaggregated: NIXL KV transfer + role-based inference
     read -ra HOSTNAMES <<< "$HOSTNAMES_STR"
@@ -275,7 +286,8 @@ if [ "$SLURM_PROCID" -lt "$NUM_INFER_NODES" ]; then
             >> $ROUTER_LOG 2>&1 &
     fi
 
-    uv run inference \
+{% if wandb_shared %}    start_vllm_metrics_logger $PORT
+{% endif %}    uv run inference \
         @ $CONFIG_DIR/inference.toml \
         --server.host 0.0.0.0 \
         --server.port $PORT \
@@ -300,7 +312,8 @@ if [ "$SLURM_PROCID" -lt "$NUM_INFER_NODES" ]; then
             >> $ROUTER_LOG 2>&1 &
     fi
 
-    if [ "$USE_DISTRIBUTED_EP" -eq 1 ]; then
+{% if wandb_shared %}    start_vllm_metrics_logger $BACKEND_PORT
+{% endif %}    if [ "$USE_DISTRIBUTED_EP" -eq 1 ]; then
         read -ra HOSTNAMES <<< "$HOSTNAMES_STR"
         REPLICA_HEAD_HOST="${HOSTNAMES[$((REPLICA_IDX * NODES_PER_INFER_REPLICA))]}"
         INFER_DP_START_RANK=$((RANK_IN_REPLICA * INFERENCE_DP_LOCAL))

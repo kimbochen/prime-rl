@@ -17,7 +17,6 @@
 {%- if exclude %}
 #SBATCH --exclude={{ exclude }}
 {%- endif %}
-#SBATCH --exclusive
 #SBATCH --output={{ output_dir }}/job_%j.log
 #SBATCH --error={{ output_dir }}/job_%j.log
 
@@ -119,6 +118,18 @@ srun bash -c '
 
     INFER_NODE_RANK=$SLURM_PROCID
     LOCAL_IP=$(hostname -I | awk "{print \$1}")
+
+    # Optionally log vLLM metrics to shared W&B (set WANDB_SHARED_MODE=1 and WANDB_PROJECT in .env)
+    start_vllm_metrics_logger() {
+        if [ "${WANDB_SHARED_MODE:-}" = "1" ] && [ -n "${WANDB_PROJECT:-}" ]; then
+            local port=$1
+            python -m prime_rl.utils.vllm_metrics_logger \
+                --metrics-url "http://localhost:${port}/metrics" \
+                --project "$WANDB_PROJECT" \
+                --node-rank "$INFER_NODE_RANK" \
+                >> $OUTPUT_DIR/logs/inference/metrics_${INFER_NODE_RANK}.log 2>&1 &
+        fi
+    }
 
 {% if disaggregated -%}
     # NVSHMEM libs for DeepEP — ensure the rpath target exists on all nodes
@@ -223,6 +234,8 @@ srun bash -c '
             >> $ROUTER_LOG 2>&1 &
     fi
 
+    start_vllm_metrics_logger $PORT
+
     uv run inference \
         @ $CONFIG_PATH \
         --server.host 0.0.0.0 \
@@ -252,6 +265,8 @@ srun bash -c '
             >> $ROUTER_LOG 2>&1 &
     fi
 
+    start_vllm_metrics_logger $BACKEND_PORT
+
     uv run inference \
         @ $CONFIG_PATH \
         --server.host 0.0.0.0 \
@@ -261,6 +276,8 @@ srun bash -c '
     echo "INFER_NODE_RANK=${INFER_NODE_RANK}, LOCAL_IP=${LOCAL_IP}" | tee $OUTPUT_DIR/logs/inference/node_${INFER_NODE_RANK}.log
     # Required for graph compilation to work
     export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False
+
+    start_vllm_metrics_logger {{ port }}
 
     uv run inference \
         @ $CONFIG_PATH \
