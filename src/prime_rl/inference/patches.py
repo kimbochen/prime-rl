@@ -1,3 +1,7 @@
+import torch
+from vllm.triton_utils import tl, triton
+
+
 def transformers_v5_compat():
     """vLLM general plugin: patch transformers v5 config attrs that vLLM 0.16 still expects.
 
@@ -10,7 +14,162 @@ def transformers_v5_compat():
         Qwen3VLMoeTextConfig.tie_word_embeddings = False
 
     _patch_qwen35_lora()
+    monkey_patch_deep_gemm_ep_scatter()
     monkey_patch_dp_engine_core_pause_resume_deadlock()
+
+
+@triton.jit
+def _apply_expert_map_triton(expert_id, expert_map):
+    if expert_id != -1:
+        expert_id = tl.load(expert_map + expert_id).to(expert_id.dtype)
+    return expert_id
+
+
+@triton.jit
+def _fwd_kernel_ep_scatter_2_int64(
+    total_token_num,
+    expert_start_loc,
+    recv_x,
+    recv_x_stride0,
+    recv_x_stride1,
+    recv_x_scale,
+    recv_x_scale_stride0,
+    recv_x_scale_stride1,
+    recv_topk,
+    recv_topk_stride0,
+    recv_topk_stride1,
+    output_tensor,
+    output_tensor_stride0,
+    output_tensor_stride1,
+    output_tensor_scale,
+    output_tensor_scale_stride0,
+    output_tensor_scale_stride1,
+    output_index,
+    output_index_stride0,
+    output_index_stride1,
+    topk_num: tl.constexpr,
+    expert_map,
+    HAS_EXPERT_MAP: tl.constexpr,
+    HIDDEN_SIZE: tl.constexpr,
+    HIDDEN_SIZE_PAD: tl.constexpr,
+    SCALE_HIDDEN_SIZE: tl.constexpr,
+    SCALE_HIDDEN_SIZE_PAD: tl.constexpr,
+):
+    start_token_id = tl.program_id(0)
+    grid_num = tl.num_programs(0)
+
+    offset_in = tl.arange(0, HIDDEN_SIZE_PAD)
+    mask = offset_in < HIDDEN_SIZE
+
+    offset_in_s = tl.arange(0, SCALE_HIDDEN_SIZE_PAD)
+    mask_s = offset_in_s < SCALE_HIDDEN_SIZE
+
+    output_tensor_stride0 = output_tensor_stride0.to(tl.int64)
+
+    for token_id in range(start_token_id, total_token_num, grid_num):
+        to_copy = tl.load(recv_x + token_id * recv_x_stride0 + offset_in, mask=mask)
+        to_copy_s = tl.load(
+            recv_x_scale + token_id * recv_x_scale_stride0 + offset_in_s,
+            mask=mask_s,
+        )
+
+        for topk_index in tl.range(0, topk_num, 1, num_stages=4):
+            expert_id = tl.load(recv_topk + token_id * recv_topk_stride0 + topk_index)
+
+            if HAS_EXPERT_MAP:
+                expert_id = _apply_expert_map_triton(expert_id, expert_map)
+
+            if expert_id >= 0:
+                dest_token_index = tl.atomic_add(expert_start_loc + expert_id, 1)
+                dest_token_index_i64 = dest_token_index.to(tl.int64)
+
+                tl.store(
+                    output_index + token_id * output_index_stride0 + topk_index,
+                    dest_token_index,
+                )
+
+                output_tensor_ptr = output_tensor + dest_token_index_i64 * output_tensor_stride0
+                output_tensor_scale_ptr = output_tensor_scale + dest_token_index * output_tensor_scale_stride0
+                tl.store(output_tensor_ptr + offset_in, to_copy, mask=mask)
+                tl.store(output_tensor_scale_ptr + offset_in_s, to_copy_s, mask=mask_s)
+
+
+def _triton_ep_scatter_int64(
+    recv_x: torch.Tensor,
+    recv_x_scale: torch.Tensor,
+    recv_topk: torch.Tensor,
+    num_recv_tokens_per_expert: torch.Tensor,
+    expert_map: torch.Tensor | None,
+    expert_start_loc: torch.Tensor,
+    output_tensor: torch.Tensor,
+    output_tensor_scale: torch.Tensor,
+    m_indices: torch.Tensor,
+    output_index: torch.Tensor,
+) -> None:
+    from vllm.model_executor.layers.fused_moe import deep_gemm_utils
+
+    block_e = 128
+    num_warps = 8
+    num_experts = num_recv_tokens_per_expert.shape[0]
+    hidden_size = recv_x.shape[1]
+
+    assert m_indices.shape[0] % block_e == 0
+    assert expert_start_loc.shape[0] == num_experts
+
+    deep_gemm_utils._fwd_kernel_ep_scatter_1[(num_experts,)](
+        num_recv_tokens_per_expert,
+        expert_start_loc,
+        m_indices,
+        num_experts=num_experts,
+        num_warps=num_warps,
+        BLOCK_E=block_e,
+        BLOCK_EXPERT_NUM=triton.next_power_of_2(num_experts),
+    )
+
+    grid = min(recv_topk.shape[0], 1024 * 8)
+    _fwd_kernel_ep_scatter_2_int64[(grid,)](
+        recv_topk.shape[0],
+        expert_start_loc,
+        recv_x,
+        recv_x.stride(0),
+        recv_x.stride(1),
+        recv_x_scale,
+        recv_x_scale.stride(0),
+        recv_x_scale.stride(1),
+        recv_topk,
+        recv_topk.stride(0),
+        recv_topk.stride(1),
+        output_tensor,
+        output_tensor.stride(0),
+        output_tensor.stride(1),
+        output_tensor_scale,
+        output_tensor_scale.stride(0),
+        output_tensor_scale.stride(1),
+        output_index,
+        output_index.stride(0),
+        output_index.stride(1),
+        topk_num=recv_topk.shape[1],
+        expert_map=expert_map,
+        HAS_EXPERT_MAP=expert_map is not None,
+        num_warps=num_warps,
+        HIDDEN_SIZE=hidden_size,
+        HIDDEN_SIZE_PAD=triton.next_power_of_2(hidden_size),
+        SCALE_HIDDEN_SIZE=recv_x_scale.shape[1],
+        SCALE_HIDDEN_SIZE_PAD=triton.next_power_of_2(recv_x_scale.shape[1]),
+    )
+
+
+def monkey_patch_deep_gemm_ep_scatter():
+    # Temporary local carry of the upstream fix while it is under review:
+    # issue: https://github.com/vllm-project/vllm/issues/39211
+    # PR:    https://github.com/vllm-project/vllm/pull/39213
+    from vllm.logger import init_logger
+    from vllm.model_executor.layers.fused_moe import deep_gemm_utils
+
+    logger = init_logger(__name__)
+
+    deep_gemm_utils.ep_scatter = torch.no_grad()(_triton_ep_scatter_int64)
+    logger.warning("Enabled int64-addressing Triton patch for vLLM DeepGEMM ep_scatter.")
 
 
 def _patch_qwen35_lora():
@@ -64,41 +223,8 @@ def _patch_qwen35_lora():
     MergedColumnParallelLinearWithShardedLoRA.slice_lora_a = slice_lora_a
 
 
-# Monkeypatch PrometheusStatLogger to avoid NotImplementedError for LoRA in DP mode
-def monkey_patch_prometheus_stat_logger_for_lora_in_dp_mode():
-    from vllm.v1.metrics import loggers as vllm_metrics_loggers
-
-    _original_prometheus_stat_logger_init = vllm_metrics_loggers.PrometheusStatLogger.__init__
-
-    def _patched_prometheus_stat_logger_init(self, vllm_config, engine_indexes=None):
-        """Patched init that temporarily disables lora_config to skip the DP mode check."""
-        original_lora_config = vllm_config.lora_config
-        vllm_config.lora_config = None
-        try:
-            _original_prometheus_stat_logger_init(self, vllm_config, engine_indexes)
-        finally:
-            vllm_config.lora_config = original_lora_config
-        # Re-initialize LoRA metrics if needed (after the DP check is bypassed)
-        if original_lora_config is not None:
-            self.labelname_max_lora = "max_lora"
-            self.labelname_waiting_lora_adapters = "waiting_lora_adapters"
-            self.labelname_running_lora_adapters = "running_lora_adapters"
-            self.max_lora = original_lora_config.max_loras
-            self.gauge_lora_info = vllm_metrics_loggers.PrometheusStatLogger._gauge_cls(
-                name="vllm:lora_requests_info",
-                documentation="Running stats on lora requests.",
-                multiprocess_mode="sum",
-                labelnames=[
-                    self.labelname_max_lora,
-                    self.labelname_waiting_lora_adapters,
-                    self.labelname_running_lora_adapters,
-                ],
-            )
-
-    vllm_metrics_loggers.PrometheusStatLogger.__init__ = _patched_prometheus_stat_logger_init
-
-
 # Monkeypatch LoadLoRAAdapter to allow loading the same adapter multiple times
+# TODO: may be removable if we pass load_inplace=True (supported since vLLM 0.18, PR #31326)
 def monkey_patch_load_lora_adapter():
     from http import HTTPStatus
 
@@ -153,6 +279,7 @@ def monkey_patch_load_lora_adapter():
 
 
 # Monkeypatch LRUCacheWorkerLoRAManager to allow loading adapter inplace without doing it every request
+# TODO: may be removable if we pass load_inplace=True (supported since vLLM 0.18, PR #31326)
 def monkey_patch_LRUCacheWorkerLoRAManager():
     from vllm.lora.worker_manager import LoRARequest, LRUCacheLoRAModelManager, LRUCacheWorkerLoRAManager
 
@@ -278,109 +405,6 @@ def monkey_patch_tokenize_params_validation():
     TokenizeParams.get_encode_kwargs = _patched_get_encode_kwargs
 
 
-def monkey_patch_hermes_tool_parser_thread_safety():
-    """Patch Hermes2ProToolParser to cache tokenizer encode/decode results.
-
-    The original __init__ calls tokenizer.encode() and tokenizer.decode() on
-    every instantiation. Under concurrent load, the shared HuggingFace tokenizer's
-    Rust backend panics with ``RuntimeError: Already borrowed`` because multiple
-    threads mutably borrow the same internal state simultaneously.
-
-    Fix: run the first __init__ (which calls encode/decode) under a lock, cache
-    the results, and reuse them for all subsequent instantiations without ever
-    touching the tokenizer again.
-    """
-    import threading
-
-    import regex as re
-    from vllm.tool_parsers.abstract_tool_parser import ToolParser
-    from vllm.tool_parsers.hermes_tool_parser import Hermes2ProToolParser
-
-    _original_init = Hermes2ProToolParser.__init__
-    _cache: dict[int, dict] = {}
-    _lock = threading.Lock()
-
-    def _patched_init(self, tokenizer):
-        from vllm.tokenizers.mistral import MistralTokenizer
-
-        # Resolve the actual tokenizer that __init__ will use for encode/decode
-        actual_tokenizer = tokenizer.tokenizer if isinstance(tokenizer, MistralTokenizer) else tokenizer
-        key = id(actual_tokenizer)
-
-        if key in _cache:
-            # Fast path: skip encode/decode entirely, set up instance from cache
-            ToolParser.__init__(self, tokenizer)
-            if isinstance(tokenizer, MistralTokenizer):
-                self.model_tokenizer = tokenizer.tokenizer
-            self.current_tool_name_sent = False
-            self.prev_tool_call_arr = []
-            self.current_tool_id = -1
-            self.streamed_args_for_tool = []
-            self.tool_call_start_token = "<tool_call>"
-            self.tool_call_end_token = "</tool_call>"
-            self.tool_call_regex = re.compile(r"<tool_call>(.*?)</tool_call>|<tool_call>(.*)", re.DOTALL)
-            self.scratch_pad_regex = re.compile(r"<scratch_pad>(.*?)</scratch_pad>", re.DOTALL)
-            cached = _cache[key]
-            self.tool_call_start_token_ids = cached["start_ids"]
-            self.tool_call_end_token_ids = cached["end_ids"]
-            self.tool_call_start_token_array = cached["start_array"]
-            self.tool_call_end_token_array = cached["end_array"]
-            self.buffered_delta_text = ""
-            return
-
-        # Slow path: first instantiation for this tokenizer, run under lock
-        with _lock:
-            if key in _cache:
-                # Another thread populated it while we waited
-                _patched_init(self, tokenizer)
-                return
-            _original_init(self, tokenizer)
-            _cache[key] = {
-                "start_ids": self.tool_call_start_token_ids,
-                "end_ids": self.tool_call_end_token_ids,
-                "start_array": self.tool_call_start_token_array,
-                "end_array": self.tool_call_end_token_array,
-            }
-
-    Hermes2ProToolParser.__init__ = _patched_init
-
-
-def monkey_patch_tokenizer_thread_safety():
-    """Patch HuggingFace tokenizer to make _encode_plus thread-safe.
-
-    Under concurrent request load, vLLM's API server calls _encode_plus from
-    multiple async handlers simultaneously. _encode_plus mutates the Rust
-    tokenizer's internal state via set_truncation_and_padding (enable_truncation/
-    enable_padding) and encode_special_tokens. The Rust backend uses RefCell-style
-    borrow tracking (PyO3), and concurrent mutable borrows cause it to panic
-    with ``RuntimeError: Already borrowed``.
-
-    Fix: wrap the entire _encode_plus method in a per-tokenizer threading lock
-    so that state mutation and the subsequent encode call are atomic.
-    """
-    import threading
-
-    from transformers import PreTrainedTokenizerFast
-
-    _original_encode_plus = PreTrainedTokenizerFast._encode_plus
-    _locks: dict[int, threading.Lock] = {}
-    _meta_lock = threading.Lock()
-
-    def _get_lock(tokenizer_id: int) -> threading.Lock:
-        if tokenizer_id not in _locks:
-            with _meta_lock:
-                if tokenizer_id not in _locks:
-                    _locks[tokenizer_id] = threading.Lock()
-        return _locks[tokenizer_id]
-
-    def _patched_encode_plus(self, *args, **kwargs):
-        lock = _get_lock(id(self._tokenizer))
-        with lock:
-            return _original_encode_plus(self, *args, **kwargs)
-
-    PreTrainedTokenizerFast._encode_plus = _patched_encode_plus
-
-
 def monkey_patch_minimax_m2_for_lora():
     """Patch vLLM's MiniMaxM2 model for LoRA compatibility.
 
@@ -457,7 +481,7 @@ def monkey_patch_minimax_m2_for_lora():
 
 
 def monkey_patch_harmony_stop_token_propagation():
-    """Fix: vLLM 0.17.0 doesn't merge harmony stop tokens into per-request SamplingParams.
+    """Fix: vLLM doesn't merge harmony stop tokens into per-request SamplingParams.
 
     The harmony mode sets stop_token_ids (including <|call|> and <|return|>) in
     default_sampling_params at server init, but ChatCompletionRequest.to_sampling_params()
@@ -716,24 +740,35 @@ def monkey_patch_fused_moe_lora_dp():
 
 
 def monkey_patch_dp_engine_core_pause_resume_deadlock():
-    """Fix deadlock with pause/resume and collective_rpc in DP engine core.
+    """Fix DP pause/resume deadlocks around weight updates.
 
-    When a request arrives for an already-completed wave while the scheduler is
-    paused, the unpatched code sends a start_wave notification that triggers
-    collective_rpc on other DP engines. But the paused engine can't participate
-    in the collective, causing a deadlock.
+    Bug 1 (job 3756): while paused, START_DP_WAVE can wake idle ranks into the
+    DP loop. Those ranks then run dummy batches and hit DP collectives while
+    other ranks are still in NCCL weight transfer.
 
-    Fix: only send the start_wave notification when the scheduler is unpaused,
-    and explicitly set engines_running=True before notifying.
+    Bug 2 (jobs 3769/3771): resume ties the DP running state to local
+    unfinished requests, but the DP wave state is global. Ranks with no local
+    work still need to re-enter the loop so they can participate in the same
+    DP collectives as ranks that are resuming remote-KV or decode work.
 
-    Upstream: https://github.com/vllm-project/vllm/pull/37024
+    Fix:
+    - ignore START_DP_WAVE wakeups while paused
+    - on resume, wake every DP rank and force an immediate global unfinished
+      sync instead of waiting for the normal 32-step cadence
+
+    This keeps the upstream pause-side fix from
+    https://github.com/vllm-project/vllm/pull/37024 and extends it with the
+    resume-side wave-state fix.
     """
+    from vllm.config import ParallelConfig
     from vllm.v1.core.sched.interface import PauseState
-    from vllm.v1.engine import EngineCoreOutputs
-    from vllm.v1.engine.core import DPEngineCoreProc, EngineCore
+    from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequestType
+    from vllm.v1.engine.core import DPEngineCoreProc, EngineCore, EngineCoreProc
     from vllm.v1.request import Request
 
     _base_add_request = EngineCore.add_request
+    _base_handle_client_request = EngineCoreProc._handle_client_request
+    _base_resume_scheduler = DPEngineCoreProc.resume_scheduler
 
     def _patched_add_request(self, request: Request, request_wave: int = 0):
         _base_add_request(self, request, request_wave)
@@ -744,4 +779,61 @@ def monkey_patch_dp_engine_core_pause_resume_deadlock():
                 self.engines_running = True
                 self.output_queue.put_nowait((-1, EngineCoreOutputs(start_wave=self.current_wave)))
 
+    def _patched_handle_client_request(self, request_type, request):
+        if request_type == EngineCoreRequestType.START_DP_WAVE:
+            new_wave, exclude_eng_index = request
+            if exclude_eng_index != self.engine_index and new_wave >= self.current_wave:
+                self.current_wave = new_wave
+                if not self.engines_running and self.scheduler.pause_state == PauseState.UNPAUSED:
+                    self.engines_running = True
+        else:
+            _base_handle_client_request(self, request_type, request)
+
+    def _patched_resume_scheduler(self):
+        was_paused = self.scheduler.pause_state != PauseState.UNPAUSED
+        _base_resume_scheduler(self)
+        if was_paused:
+            self.engines_running = True
+            self._force_dp_running_state_sync = True
+
+    def _patched_has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
+        self.step_counter += 1
+        if getattr(self, "_force_dp_running_state_sync", False):
+            self._force_dp_running_state_sync = False
+            return ParallelConfig.has_unfinished_dp(self.dp_group, local_unfinished)
+        if self.step_counter % 32 != 0:
+            return True
+        return ParallelConfig.has_unfinished_dp(self.dp_group, local_unfinished)
+
     DPEngineCoreProc.add_request = _patched_add_request
+    DPEngineCoreProc._handle_client_request = _patched_handle_client_request
+    DPEngineCoreProc.resume_scheduler = _patched_resume_scheduler
+    DPEngineCoreProc._has_global_unfinished_reqs = _patched_has_global_unfinished_reqs
+
+
+def monkey_patch_no_moe_lora():
+    """This disables LoRA for MoE layers and makes them pick better kernels.
+
+    Otherwise, the oracle will always try to pick TritonExperts.
+    For blackwells, we want TRTLLMFlashInfer.
+    """
+    from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig, logger
+
+    def _patched__post_init__(self: FusedMoEConfig):
+        if self.dp_size > 1:
+            logger.debug_once("Using FusedMoEConfig::max_num_tokens=%d", self.max_num_tokens)
+
+        assert self.max_num_tokens > 0
+
+        if self.router_logits_dtype is None:
+            self.router_logits_dtype = self.in_dtype
+
+        if self.hidden_dim_unpadded is None:
+            self.hidden_dim_unpadded = self.hidden_dim
+        if self.intermediate_size_per_partition_unpadded is None:
+            self.intermediate_size_per_partition_unpadded = self.intermediate_size_per_partition
+
+        # Disable LoRA for MoE layers
+        self.is_lora_enabled = False
+
+    FusedMoEConfig.__post_init__ = _patched__post_init__

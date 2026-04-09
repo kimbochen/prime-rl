@@ -1,3 +1,4 @@
+import warnings
 from pathlib import Path
 from typing import Annotated, Literal, TypeAlias
 
@@ -5,8 +6,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from prime_rl.configs.shared import (
     HeartbeatConfig,
-    LogConfig,
     SlurmConfig,
+    TrainerLogConfig,
     WandbConfig,
 )
 from prime_rl.configs.trainer import (
@@ -14,6 +15,7 @@ from prime_rl.configs.trainer import (
     BenchConfig,
     CheckpointConfig,
     ConstantSchedulerConfig,
+    GCConfig,
     ModelConfig,
     OptimizerConfig,
     SchedulerConfig,
@@ -182,7 +184,7 @@ class SFTConfig(BaseConfig):
     ckpt: CheckpointConfig | None = None
 
     # The logging configuration
-    log: LogConfig = LogConfig()
+    log: TrainerLogConfig = TrainerLogConfig()
 
     # The wandb configuration
     wandb: WandbConfig | None = None
@@ -214,6 +216,13 @@ class SFTConfig(BaseConfig):
             description="Whether to run in benchmark mode. It will automatically set the maximum number of steps to run to 4 and use fake data.",
         ),
     ] = None
+
+    gc: Annotated[
+        GCConfig | None,
+        Field(
+            description="Garbage collection config. Disables automatic GC and runs deterministic collections every N steps to avoid stragglers. Set to null to use Python's default GC behavior.",
+        ),
+    ] = GCConfig()
 
     trace_path: Annotated[Path | None, Field(description="Path to write pytorch profiler trace to.")] = None
 
@@ -262,6 +271,17 @@ class SFTConfig(BaseConfig):
         return data
 
     ### Validate configs (e.g. raise for unsupported (combinations of) configs)
+
+    @model_validator(mode="after")
+    def deepep_disables_grad_clipping(self):
+        if self.model.ep_comm_backend == "deepep" and self.optim.max_norm is not None:
+            warnings.warn(
+                "Gradient clipping is not compatible with DeepEP. "
+                "Automatically setting optim.max_norm to None (disabled).",
+                stacklevel=1,
+            )
+            self.optim.max_norm = None
+        return self
 
     @model_validator(mode="after")
     def validate_deployment(self):

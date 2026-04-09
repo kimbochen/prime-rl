@@ -1,3 +1,5 @@
+import prime_rl._compat  # noqa: F401 — patch ring_flash_attn compat before import
+
 import time
 from contextlib import nullcontext
 from datetime import timedelta
@@ -32,6 +34,7 @@ from prime_rl.trainer.parallel_dims import get_parallel_dims
 from prime_rl.trainer.perf import get_perf_counter
 from prime_rl.trainer.sft.data import load_sft_dataset, setup_dataloader, setup_dataset
 from prime_rl.trainer.utils import (
+    GarbageCollection,
     MemoryProfiler,
     export_benchmark_json,
     get_zero_gradient_ratio,
@@ -44,6 +47,7 @@ from prime_rl.trainer.world import get_world
 from prime_rl.utils.heartbeat import Heartbeat
 from prime_rl.utils.monitor import setup_monitor
 from prime_rl.utils.config import cli
+from prime_rl.utils.process import set_proc_title
 from prime_rl.utils.utils import clean_exit, to_col_format
 import torch.distributed as dist
 from liger_kernel.transformers.cross_entropy import LigerCrossEntropyLoss
@@ -58,7 +62,6 @@ def train(config: SFTConfig):
     world = get_world()
     logger = setup_logger(
         config.log.level,
-        log_file=config.output_dir / "logs" / "trainer" / f"rank_{world.rank}.log" if config.log.file else None,
         json_logging=config.log.json_logging,
     )
     logger.info(f"Starting SFT trainer in {world}")
@@ -103,7 +106,7 @@ def train(config: SFTConfig):
         cp_rank = parallel_dims.world_mesh["cp"].get_local_rank()
         substitute_hf_flash_attn(cp_group, heads_k_stride=1)
         substitute_ring_attn(cp_group, heads_k_stride=1, attn_impl=config.model.attn)
-        from prime_rl.utils.cp import setup_hybrid_cp
+        from prime_rl.utils.cp import setup_hybrid_cp, setup_sparse_mla_cp
 
     # Set up checkpoint manager
     logger.info(f"Initializing checkpoint managers ({config.ckpt})")
@@ -124,6 +127,7 @@ def train(config: SFTConfig):
 
     if parallel_dims.cp_enabled:
         setup_hybrid_cp(model, cp_group, cp_rank, parallel_dims.cp)
+        setup_sparse_mla_cp(model, cp_group, cp_rank, parallel_dims.cp)
 
     if config.model.lora is not None:
         multi_run_manager = get_multi_run_manager()
@@ -271,6 +275,8 @@ def train(config: SFTConfig):
             logger.success(f"Validation | Step {step} | Loss: {mean_loss:.4f}")
         monitor.log({"val/loss": mean_loss, "step": step}, step=step)
 
+    gc_handler = GarbageCollection(config.gc.interval) if config.gc else None
+
     logger.info(f"Starting training loop (max_steps={config.max_steps or 'infinite'})")
     max_memory = torch.cuda.mem_get_info()[1] / 1024**3  # GiB
     is_first_step = True
@@ -281,6 +287,8 @@ def train(config: SFTConfig):
     while True:
         # Reset peak memory stats
         torch.cuda.reset_peak_memory_stats()
+        if gc_handler is not None:
+            gc_handler.run(progress.step)
         is_last_step = config.max_steps is not None and progress.step == config.max_steps
 
         if (
@@ -388,12 +396,14 @@ def train(config: SFTConfig):
             batch_loss = 0.0
         nan_loss_count = nan_loss_count.item()
 
-        logger.debug(f"Clipping gradients with max norm {config.optim.max_norm}")
-        grad_norm = clip_grad_norm_(
-            model.parameters(), max_norm=config.optim.max_norm, ep_enabled=parallel_dims.ep_enabled
-        )
-        if grad_norm.device.type == "cpu":
-            grad_norm = grad_norm.to(torch.device("cuda"))
+        grad_norm: torch.Tensor | None = None
+        if config.optim.max_norm is not None:
+            logger.debug(f"Clipping gradients with max norm {config.optim.max_norm}")
+            grad_norm = clip_grad_norm_(
+                model.parameters(), max_norm=config.optim.max_norm, ep_enabled=parallel_dims.ep_enabled
+            )
+            if grad_norm.device.type == "cpu":
+                grad_norm = grad_norm.to(torch.device("cuda"))
         zero_grad_ratio = get_zero_gradient_ratio(model.parameters(), parallel_dims.dp_replicate)
 
         logger.debug("Optimizer step")
@@ -421,7 +431,10 @@ def train(config: SFTConfig):
 
         # Log step metrics
         step_time = time.perf_counter() - step_start_time
-        step_message = f"Step {progress.step} | Time: {step_time:.2f}s | Loss: {batch_loss:.4f} | Grad. Norm: {grad_norm:.4f} | LR: {current_lr:.2e} | Throughput: {throughput:.0f} tokens/s | MFU: {mfu:.1f}% | Peak Mem.: {peak_memory:.1f}/{max_memory:.1f} GiB ({peak_memory / max_memory * 100:.1f}%)"
+        step_message = f"Step {progress.step} | Time: {step_time:.2f}s | Loss: {batch_loss:.4f}"
+        if grad_norm is not None:
+            step_message += f" | Grad. Norm: {grad_norm:.4f}"
+        step_message += f" | LR: {current_lr:.2e} | Throughput: {throughput:.0f} tokens/s | MFU: {mfu:.1f}% | Peak Mem.: {peak_memory:.1f}/{max_memory:.1f} GiB ({peak_memory / max_memory * 100:.1f}%)"
         if is_tt_moe_model(model) and batch_max_vio.item() > 0:
             step_message += f" | Max Vio: {batch_max_vio.item():.4f}"
         logger.success(step_message)
@@ -462,10 +475,11 @@ def train(config: SFTConfig):
         # Log optimizer metrics
         optim_metrics = {
             "optim/lr": current_lr,
-            "optim/grad_norm": grad_norm.item(),
             "optim/zero_grad_ratio": zero_grad_ratio,
             "step": progress.step,
         }
+        if grad_norm is not None:
+            optim_metrics["optim/grad_norm"] = grad_norm.item()
         monitor.log(optim_metrics, step=progress.step)
 
         loss_log_metrics = {
@@ -534,6 +548,7 @@ def train(config: SFTConfig):
 
 
 def main():
+    set_proc_title("SFTTrainer")
     train(cli(SFTConfig))
 
 

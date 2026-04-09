@@ -1,3 +1,4 @@
+import warnings
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypeAlias
 
@@ -7,8 +8,8 @@ from prime_rl.configs.shared import (
     BaseModelConfig,
     FileSystemTransportConfig,
     HeartbeatConfig,
-    LogConfig,
     MetricsServerConfig,
+    TrainerLogConfig,
     TransportConfig,
     WandbConfig,
 )
@@ -17,12 +18,29 @@ from prime_rl.utils.config import BaseConfig
 # -- Shared trainer configs (used by both SFT and RL trainers) --
 
 AttnImplementation: TypeAlias = Literal["sdpa", "flash_attention_2", "flash_attention_3", "fa4"]
+EPCommBackend: TypeAlias = Literal["torch", "deepep"]
 
 # User-facing name -> internal name. Users set `flash_attention_4` in configs,
 # which gets rewritten to `fa4` before pydantic validation.
 # We use `fa4` internally because `flash_attention_*` triggers transformers
 # to attempt installing a kernel from hub.
 _ATTN_ALIASES = {"flash_attention_4": "fa4"}
+
+
+class GCConfig(BaseConfig):
+    """Configures deterministic garbage collection to avoid stragglers in distributed training.
+
+    Disables Python's automatic GC and runs manual collections every `freq` steps so all
+    ranks collect simultaneously, preventing one rank from stalling others.
+    """
+
+    interval: Annotated[
+        int,
+        Field(
+            ge=1,
+            description="Run garbage collection every `interval` training steps.",
+        ),
+    ] = 50
 
 
 class ActivationCheckpointConfig(BaseConfig):
@@ -46,12 +64,13 @@ class ActivationCheckpointConfig(BaseConfig):
     targets: Annotated[
         list[str],
         Field(
-            description="Selective checkpoint targets. `norm` checkpoints every norm module inside selected layers (decoder, attention, MLA, etc.). `attn_proj` checkpoints QKV projections, QK norms, RoPE, and output projection — everything in the attention layer except the kernel. `mlp` checkpoints the entire dense MLP forward (not applicable to MoE layers). `mla_up_proj` checkpoints MLA Q/KV up-projection work where supported. `routed_experts` checkpoints routed expert compute in MoE layers (including LatentMoE). `mamba` checkpoints the Mamba mixer forward in NemotronH Mamba layers. `linear_attn` checkpoints the GatedDeltaNet forward in Qwen3.5-MoE linear attention layers.",
+            description="Selective checkpoint targets. `norm` checkpoints every norm module inside selected layers (decoder, attention, MLA, etc.). `attn_proj` checkpoints projection-side attention work outside the kernel, including input/output projections, attention-local norms, RoPE, gating, and model-specific MLA projection helpers where exposed. `mlp` checkpoints the entire dense MLP forward (not applicable to MoE layers). `mla_up_proj` checkpoints MLA Q/KV up-projection work where supported. `routed_experts` checkpoints routed expert compute in MoE layers (including LatentMoE). `linear_attn` checkpoints supported token mixers outside the standard softmax-attention path, including NemotronH Mamba layers, Qwen3.5-MoE GatedDeltaNet layers, and AFMoE sliding-window attention layers.",
         ),
     ] = ["norm"]
 
     @model_validator(mode="after")
     def validate_selective_targets(self):
+        self.targets = list(dict.fromkeys(self.targets))
         if self.mode == "selective" and not self.targets:
             raise ValueError("Selective activation checkpointing requires at least one target.")
         return self
@@ -222,6 +241,42 @@ class ModelConfig(BaseModelConfig):
         ),
     ] = 1
 
+    ep_comm_backend: Annotated[
+        EPCommBackend,
+        Field(
+            description=(
+                "Communication backend for expert parallelism. "
+                "`torch` uses TorchTitan all-to-all collectives and `deepep` uses DeepEP custom kernels."
+            ),
+        ),
+    ] = "torch"
+
+    deepep_num_sms: Annotated[
+        int,
+        Field(
+            ge=1,
+            description=(
+                "Number of SMs to allocate for DeepEP intranode dispatch/combine kernels. "
+                "Also determines internode RDMA channel count (num_channels = num_sms / 2). "
+                "Lower values leave more SMs for compute; higher values speed up dispatch/combine. "
+                "The optimal value depends on the EP degree and hardware."
+                "Only used when ep_comm_backend='deepep'."
+            ),
+        ),
+    ] = 20
+
+    deepep_token_chunk_size: Annotated[
+        int | None,
+        Field(
+            ge=1,
+            description=(
+                "Optional token chunk size for DeepEP MoE pipelining. "
+                "When set, DeepEP dispatch for chunk i+1 is launched while experts compute chunk i. "
+                "Only used when ep_comm_backend='deepep'."
+            ),
+        ),
+    ] = None
+
     cp: Annotated[
         int,
         Field(
@@ -347,6 +402,16 @@ class ModelConfig(BaseModelConfig):
             raise ValueError("Flash attention 4 is only supported with the custom implementation")
         return self
 
+    @model_validator(mode="after")
+    def validate_ep_comm_backend(self):
+        if self.ep_comm_backend == "torch":
+            return self
+
+        if self.ep <= 1:
+            raise ValueError(f"model.ep_comm_backend='{self.ep_comm_backend}' requires model.ep > 1.")
+
+        return self
+
 
 class TokenizerConfig(BaseConfig):
     """Configuration for the tokenizer."""
@@ -417,7 +482,9 @@ SchedulerConfig: TypeAlias = Annotated[
 class BaseOptimizerConfig(BaseModel):
     lr: Annotated[float, Field(ge=0)] = 1e-6
     weight_decay: Annotated[float, Field(ge=0)] = 0.01
-    max_norm: Annotated[float, Field(ge=0, description="Maximum gradient norm to clip.")] = 1.0
+    max_norm: Annotated[
+        float | None, Field(ge=0, description="Maximum gradient norm to clip. If None, gradient clipping is disabled.")
+    ] = 1.0
 
 
 class SGDConfig(BaseOptimizerConfig):
@@ -445,7 +512,13 @@ class MuonConfig(BaseOptimizerConfig):
     ] = 0.95
 
 
-OptimizerConfig: TypeAlias = Annotated[SGDConfig | AdamWConfig | MuonConfig, Field(discriminator="type")]
+class SignSGDConfig(BaseOptimizerConfig):
+    type: Literal["sign_sgd"] = "sign_sgd"
+
+
+OptimizerConfig: TypeAlias = Annotated[
+    SGDConfig | AdamWConfig | MuonConfig | SignSGDConfig, Field(discriminator="type")
+]
 
 
 class WeightCheckpointConfig(BaseConfig):
@@ -565,8 +638,8 @@ class DefaultLossConfig(BaseModel):
 
     type: Literal["default"] = "default"
 
-    ipo_mask_low: Annotated[float, Field(ge=0, description="The low threshold for masking tokens.")] = 0.2
-    ipo_mask_high: Annotated[float, Field(ge=0, description="The high threshold for masking tokens.")] = 0.2
+    dppo_mask_low: Annotated[float, Field(ge=0, description="The low threshold for masking tokens.")] = 0.2
+    dppo_mask_high: Annotated[float, Field(ge=0, description="The high threshold for masking tokens.")] = 0.2
     adv_tau: Annotated[float, Field(ge=0, description="The tau for advantages.")] = 1.0
     teacher_tau: Annotated[float, Field(ge=0, description="The tau for teacher logprobs.")] = 0.0
     kl_tau: Annotated[float, Field(ge=0, description="The tau for KL divergence.")] = 1e-3
@@ -675,7 +748,7 @@ class TrainerConfig(BaseConfig):
     rollout_transport: TransportConfig = FileSystemTransportConfig()
 
     # The logging configuration
-    log: LogConfig = LogConfig()
+    log: TrainerLogConfig = TrainerLogConfig()
 
     # The wandb configuration
     wandb: WandbConfig | None = None
@@ -718,6 +791,13 @@ class TrainerConfig(BaseConfig):
         ),
     ] = None
 
+    gc: Annotated[
+        GCConfig | None,
+        Field(
+            description="Garbage collection config. Disables automatic GC and runs deterministic collections every N steps to avoid stragglers. Set to null to use Python's default GC behavior.",
+        ),
+    ] = GCConfig()
+
     trace_path: Annotated[Path | None, Field(description="Path to write pytorch profiler trace to.")] = None
 
     dist_timeout_seconds: Annotated[
@@ -745,12 +825,32 @@ class TrainerConfig(BaseConfig):
     ] = 1
 
     @model_validator(mode="after")
+    def deepep_disables_grad_clipping(self):
+        if self.model.ep_comm_backend == "deepep" and self.optim.max_norm is not None:
+            warnings.warn(
+                "Gradient clipping is not compatible with DeepEP. "
+                "Automatically setting optim.max_norm to None (disabled).",
+                stacklevel=1,
+            )
+            self.optim.max_norm = None
+        return self
+
+    @model_validator(mode="after")
     def vlms_require_bfloat16(self):
         if self.model.vlm is not None and (
             self.model.optimization_dtype != "bfloat16" or self.model.reduce_dtype != "bfloat16"
         ):
             raise ValueError(
                 "VLM models must use optimization_dtype='bfloat16' and reduce_dtype='bfloat16' to match vLLM inference."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def vlm_freeze_incompatible_with_lora(self):
+        if self.model.vlm is not None and not self.model.vlm.freeze_vision_encoder and self.model.lora is not None:
+            raise ValueError(
+                "freeze_vision_encoder=false is incompatible with LoRA. "
+                "LoRA freezes all non-adapter parameters including the vision encoder."
             )
         return self
 
